@@ -9,7 +9,6 @@ from random import choice
 import numpy as np
 from collections import deque
 import time
-import math
 
 import json
 from keras.models import model_from_json
@@ -18,7 +17,6 @@ from keras.layers.core import Dense, Dropout, Activation, Flatten
 from keras.layers import Convolution2D, Dense, Flatten, merge, MaxPooling2D, Input, AveragePooling2D, Lambda, Merge, Activation, Embedding
 from keras.optimizers import SGD, Adam, rmsprop
 from keras import backend as K
-from keras.utils import np_utils
 
 from vizdoom import DoomGame, ScreenResolution
 from vizdoom import *
@@ -36,40 +34,34 @@ def preprocessImg(img, size):
     img = skimage.color.rgb2gray(img)
 
     return img
+    
 
-class C51Agent:
+class DoubleDQNAgent:
 
-    def __init__(self, state_size, action_size, num_atoms):
+    def __init__(self, state_size, action_size):
 
         # get size of state and action
         self.state_size = state_size
         self.action_size = action_size
 
-        # these is hyper parameters for the DQN
+        # these is hyper parameters for the Double DQN
         self.gamma = 0.99
         self.learning_rate = 0.0001
         self.epsilon = 1.0
         self.initial_epsilon = 1.0
         self.final_epsilon = 0.0001
         self.batch_size = 32
-        self.observe = 2000
-        self.explore = 50000
+        self.observe = 5000
+        self.explore = 50000 
         self.frame_per_action = 4
         self.update_target_freq = 3000 
         self.timestep_per_train = 100 # Number of timesteps between training interval
 
-        # Initialize Atoms
-        self.num_atoms = num_atoms # 51 for C51
-        self.v_max = 30 # Max possible score for Defend the center is 26 - 0.1*26 = 23.4
-        self.v_min = -10 # -0.1*26 - 1 = -3.6
-        self.delta_z = (self.v_max - self.v_min) / float(self.num_atoms - 1)
-        self.z = [self.v_min + i * self.delta_z for i in range(self.num_atoms)]
-
-        # Create replay memory using deque
+        # create replay memory using deque
         self.memory = deque()
         self.max_memory = 50000 # number of previous transitions to remember
 
-        # Models for value distribution
+        # create main model and target model
         self.model = None
         self.target_model = None
 
@@ -93,25 +85,12 @@ class C51Agent:
         if np.random.rand() <= self.epsilon:
             action_idx = random.randrange(self.action_size)
         else:
-            action_idx = self.get_optimal_action(state)
-
-        return action_idx
-
-    def get_optimal_action(self, state):
-        """Get optimal action for a state
-        """
-        z = self.model.predict(state) # Return a list [1x51, 1x51, 1x51]
-
-        z_concat = np.vstack(z)
-        q = np.sum(np.multiply(z_concat, np.array(self.z)), axis=1) 
-
-        # Pick action with the biggest Q value
-        action_idx = np.argmax(q)
-        
+            q = self.model.predict(state)
+            action_idx = np.argmax(q)
         return action_idx
 
     def shape_reward(self, r_t, misc, prev_misc, t):
-        
+
         # Check any kill count
         if (misc[0] > prev_misc[0]):
             r_t = r_t + 1
@@ -124,7 +103,7 @@ class C51Agent:
 
         return r_t
 
-    # save sample <s,a,r,s'> to the replay memory
+    # Save trajectory sample <s,a,r,s'> to the replay memory
     def replay_memory(self, s_t, action_idx, r_t, s_t1, is_terminated, t):
         self.memory.append((s_t, action_idx, r_t, s_t1, is_terminated))
         if self.epsilon > self.final_epsilon and t > self.observe:
@@ -137,54 +116,84 @@ class C51Agent:
         if t % self.update_target_freq == 0:
             self.update_target_model()
 
-    # pick samples randomly from replay memory (with batch_size)
+    # Pick samples randomly from replay memory (with batch_size)
+    def train_minibatch_replay(self):
+        """
+        Train on a single minibatch
+        """
+        batch_size = min(self.batch_size, len(self.memory))
+        mini_batch = random.sample(self.memory, batch_size)
+
+        update_input = np.zeros(((batch_size,) + self.state_size)) # Shape 64, img_rows, img_cols, 4
+        update_target = np.zeros(((batch_size,) + self.state_size))
+        action, reward, done = [], [], []
+
+        for i in range(batch_size):
+            update_input[i,:,:,:] = mini_batch[i][0]
+            action.append(mini_batch[i][1])
+            reward.append(mini_batch[i][2])
+            update_target[i,:,:,:] = mini_batch[i][3]
+            done.append(mini_batch[i][4])
+
+        target = self.model.predict(update_input) # Shape 64, Num_Actions
+
+        target_val = self.model.predict(update_target)
+        target_val_ = self.target_model.predict(update_target)
+
+        for i in range(self.batch_size):
+            # like Q Learning, get maximum Q value at s'
+            # But from target model
+            if done[i]:
+                target[i][action[i]] = reward[i]
+            else:
+                # the key point of Double DQN
+                # selection of action is from model
+                # update is from target model
+                a = np.argmax(target_val[i])
+                target[i][action[i]] = reward[i] + self.gamma * (target_val_[i][a])
+
+        # make minibatch which includes target q value and predicted q value
+        # and do the model fit!
+        loss = self.model.train_on_batch(update_input, target)
+
+        return np.max(target[-1]), loss
+
+    # Pick samples randomly from replay memory (with batch_size)
     def train_replay(self):
 
         num_samples = min(self.batch_size * self.timestep_per_train, len(self.memory))
         replay_samples = random.sample(self.memory, num_samples)
 
-        state_inputs = np.zeros(((num_samples,) + self.state_size)) 
-        next_states = np.zeros(((num_samples,) + self.state_size)) 
-        m_prob = [np.zeros((num_samples, self.num_atoms)) for i in range(action_size)]
+        update_input = np.zeros(((num_samples,) + self.state_size)) 
+        update_target = np.zeros(((num_samples,) + self.state_size))
         action, reward, done = [], [], []
 
         for i in range(num_samples):
-            state_inputs[i,:,:,:] = replay_samples[i][0]
+            update_input[i,:,:,:] = replay_samples[i][0]
             action.append(replay_samples[i][1])
             reward.append(replay_samples[i][2])
-            next_states[i,:,:,:] = replay_samples[i][3]
+            update_target[i,:,:,:] = replay_samples[i][3]
             done.append(replay_samples[i][4])
 
-        z = self.model.predict(next_states) # Return a list [32x51, 32x51, 32x51]
-        z_ = self.model.predict(next_states) # Return a list [32x51, 32x51, 32x51]
+        target = self.model.predict(update_input) 
+        target_val = self.model.predict(update_target)
+        target_val_ = self.target_model.predict(update_target)
 
-        # Get Optimal Actions for the next states (from distribution z)
-        optimal_action_idxs = []
-        z_concat = np.vstack(z)
-        q = np.sum(np.multiply(z_concat, np.array(self.z)), axis=1) # length (num_atoms x num_actions)
-        q = q.reshape((num_samples, action_size), order='F')
-        optimal_action_idxs = np.argmax(q, axis=1)
-
-        # Project Next State Value Distribution (of optimal action) to Current State
         for i in range(num_samples):
-            if done[i]: # Terminal State
-                # Distribution collapses to a single point
-                Tz = min(self.v_max, max(self.v_min, reward[i]))
-                bj = (Tz - self.v_min) / self.delta_z 
-                m_l, m_u = math.floor(bj), math.ceil(bj)
-                m_prob[action[i]][i][int(m_l)] += (m_u - bj)
-                m_prob[action[i]][i][int(m_u)] += (bj - m_l)
+            # like Q Learning, get maximum Q value at s'
+            # But from target model
+            if done[i]:
+                target[i][action[i]] = reward[i]
             else:
-                for j in range(self.num_atoms):
-                    Tz = min(self.v_max, max(self.v_min, reward[i] + self.gamma * self.z[j]))
-                    bj = (Tz - self.v_min) / self.delta_z 
-                    m_l, m_u = math.floor(bj), math.ceil(bj)
-                    m_prob[action[i]][i][int(m_l)] += z_[optimal_action_idxs[i]][i][j] * (m_u - bj)
-                    m_prob[action[i]][i][int(m_u)] += z_[optimal_action_idxs[i]][i][j] * (bj - m_l)
+                # the key point of Double DQN
+                # selection of action is from model
+                # update is from target model
+                a = np.argmax(target_val[i])
+                target[i][action[i]] = reward[i] + self.gamma * (target_val_[i][a])
 
-        loss = self.model.fit(state_inputs, m_prob, batch_size=self.batch_size, nb_epoch=1, verbose=0)
+        loss = self.model.fit(update_input, target, batch_size=self.batch_size, epochs=1, verbose=0)
 
-        return loss.history['loss']
+        return np.max(target[-1]), loss.history['loss']
 
     # load the saved model
     def load_model(self, name):
@@ -193,6 +202,7 @@ class C51Agent:
     # save the model which is under training
     def save_model(self, name):
         self.model.save_weights(name)
+
 
 if __name__ == "__main__":
 
@@ -204,13 +214,14 @@ if __name__ == "__main__":
 
     game = DoomGame()
     game.load_config("../../scenarios/defend_the_center.cfg")
-    game.set_sound_enabled(True)
+    game.set_sound_enabled(False)
     game.set_screen_resolution(ScreenResolution.RES_640X480)
-    game.set_window_visible(False)
+    game.set_window_visible(True)
     game.init()
 
     game.new_episode()
     game_state = game.get_state()
+
     misc = game_state.game_variables  # [KILLCOUNT, AMMO, HEALTH]
     prev_misc = misc
 
@@ -220,18 +231,15 @@ if __name__ == "__main__":
     # Convert image into Black and white
     img_channels = 4 # We stack 4 frames
 
-    # C51
-    num_atoms = 51
-
     state_size = (img_rows, img_cols, img_channels)
-    agent = C51Agent(state_size, action_size, num_atoms)
+    agent = DoubleDQNAgent(state_size, action_size)
 
-    agent.model = Networks.value_distribution_network(state_size, num_atoms, action_size, agent.learning_rate)
-    agent.target_model = Networks.value_distribution_network(state_size, num_atoms, action_size, agent.learning_rate)
+    agent.model = Networks.dqn(state_size, action_size, agent.learning_rate)
+    agent.target_model = Networks.dqn(state_size, action_size, agent.learning_rate)
 
     x_t = game_state.screen_buffer # 480 x 640
     x_t = preprocessImg(x_t, size=(img_rows, img_cols))
-    s_t = np.stack(([x_t]*4), axis=2)    # It becomes 64x64x4
+    s_t = np.stack(([x_t]*4), axis=2) # It becomes 64x64x4
     s_t = np.expand_dims(s_t, axis=0) # 1x64x64x4
 
     is_terminated = game.is_episode_finished()
@@ -249,6 +257,7 @@ if __name__ == "__main__":
     while not game.is_episode_finished():
 
         loss = 0
+        Q_max = 0
         r_t = 0
         a_t = np.zeros([action_size])
 
@@ -293,7 +302,7 @@ if __name__ == "__main__":
         else:
             life += 1
 
-        #update the cache
+        # Update the cache
         prev_misc = misc
 
         # save the sample <s, a, r, s'> to the replay memory and decrease epsilon
@@ -301,15 +310,15 @@ if __name__ == "__main__":
 
         # Do the training
         if t > agent.observe and t % agent.timestep_per_train == 0:
-            loss = agent.train_replay()
-
+            Q_max, loss = agent.train_replay()
+            
         s_t = s_t1
         t += 1
 
         # save progress every 10000 iterations
         if t % 10000 == 0:
             print("Now we save model")
-            agent.model.save_weights("models/c51_ddqn.h5", overwrite=True)
+            agent.model.save_weights("models/ddqn.h5", overwrite=True)
 
         # print info
         state = ""
@@ -323,7 +332,7 @@ if __name__ == "__main__":
         if (is_terminated):
             print("TIME", t, "/ GAME", GAME, "/ STATE", state, \
                   "/ EPSILON", agent.epsilon, "/ ACTION", action_idx, "/ REWARD", r_t, \
-                  "/ LIFE", max_life, "/ LOSS", loss)
+                  "/ Q_MAX %e" % np.max(Q_max), "/ LIFE", max_life, "/ LOSS", loss)
 
             # Save Agent's Performance Statistics
             if GAME % agent.stats_window_size == 0 and t > agent.observe: 
@@ -337,7 +346,7 @@ if __name__ == "__main__":
                 life_buffer, ammo_buffer, kills_buffer = [], [], [] 
 
                 # Write Rolling Statistics to file
-                with open("statistics/c51_ddqn_stats.txt", "w") as stats_file:
+                with open("statistics/ddqn_stats.txt", "w") as stats_file:
                     stats_file.write('Game: ' + str(GAME) + '\n')
                     stats_file.write('Max Score: ' + str(max_life) + '\n')
                     stats_file.write('mavg_score: ' + str(agent.mavg_score) + '\n')
