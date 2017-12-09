@@ -9,6 +9,9 @@ from random import choice
 import numpy as np
 from collections import deque
 import time
+import datetime
+import sys
+import os
 
 import json
 from keras.models import model_from_json
@@ -17,6 +20,7 @@ from keras.layers.core import Dense, Dropout, Activation, Flatten
 from keras.layers import Convolution2D, Dense, Flatten, merge, MaxPooling2D, Input, AveragePooling2D, Lambda, Merge, Activation, Embedding
 from keras.optimizers import SGD, Adam, rmsprop
 from keras import backend as K
+import keras
 
 from vizdoom import DoomGame, ScreenResolution
 from vizdoom import *
@@ -26,6 +30,17 @@ import tensorflow as tf
 
 from networks import Networks
 
+class Tee(object):
+    def __init__(self, *files):
+        self.files = files
+    def write(self, obj):
+        for f in self.files:
+            f.write(obj)
+
+log_file_name = datetime.datetime.now().strftime("log_%Y_%m_%d_%H_%M_%S.txt")
+log_file = open(log_file_name, "w")
+backup = sys.stdout
+sys.stdout = Tee(sys.stdout, log_file)
 
 def preprocessImg(img, size):
 
@@ -216,7 +231,7 @@ if __name__ == "__main__":
     game.load_config("../../scenarios/defend_the_center.cfg")
     game.set_sound_enabled(False)
     game.set_screen_resolution(ScreenResolution.RES_640X480)
-    game.set_window_visible(True)
+    game.set_window_visible(False)
     game.init()
 
     game.new_episode()
@@ -233,8 +248,13 @@ if __name__ == "__main__":
 
     state_size = (img_rows, img_cols, img_channels)
     agent = DoubleDQNAgent(state_size, action_size)
-
     agent.model = Networks.dqn(state_size, action_size, agent.learning_rate)
+
+    if os.path.isfile("models/ddqn.h5"):
+        print("Found model, loading")
+        agent.model.load_weights("models/ddqn.h5")
+        print("loaded")
+
     agent.target_model = Networks.dqn(state_size, action_size, agent.learning_rate)
 
     x_t = game_state.screen_buffer # 480 x 640
@@ -315,8 +335,8 @@ if __name__ == "__main__":
         s_t = s_t1
         t += 1
 
-        # save progress every 10000 iterations
-        if t % 10000 == 0:
+        # save progress every 1000 iterations
+        if t % 1000 == 0:
             print("Now we save model")
             agent.model.save_weights("models/ddqn.h5", overwrite=True)
 
@@ -329,11 +349,12 @@ if __name__ == "__main__":
         else:
             state = "train"
 
-        if (is_terminated):
-            print("TIME", t, "/ GAME", GAME, "/ STATE", state, \
-                  "/ EPSILON", agent.epsilon, "/ ACTION", action_idx, "/ REWARD", r_t, \
-                  "/ Q_MAX %e" % np.max(Q_max), "/ LIFE", max_life, "/ LOSS", loss)
+        print("TIME", t, "/ GAME", GAME, "/ STATE", state, \
+              "/ EPSILON", agent.epsilon, "/ ACTION", action_idx, "/ REWARD", r_t, \
+              "/ Q_MAX %e" % np.max(Q_max), "/ LIFE", max_life, "/ LOSS", loss)
 
+
+        if (is_terminated):
             # Save Agent's Performance Statistics
             if GAME % agent.stats_window_size == 0 and t > agent.observe: 
                 print("Update Rolling Statistics")
@@ -346,7 +367,7 @@ if __name__ == "__main__":
                 life_buffer, ammo_buffer, kills_buffer = [], [], [] 
 
                 # Write Rolling Statistics to file
-                with open("statistics/ddqn_stats.txt", "w") as stats_file:
+                with open("statistics/ddqn_stats.txt", "w+") as stats_file:
                     stats_file.write('Game: ' + str(GAME) + '\n')
                     stats_file.write('Max Score: ' + str(max_life) + '\n')
                     stats_file.write('mavg_score: ' + str(agent.mavg_score) + '\n')
